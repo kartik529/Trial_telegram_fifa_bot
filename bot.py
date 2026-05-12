@@ -243,15 +243,29 @@ async def check_and_notify(app: Application):
 
         # 1) Specific match tracking — alert on EVERY change
         for c in changes:
-            # Match against tracked keys (handle truncation)
-            if any(c["key"].startswith(t[:len(c["key"])]) or t.startswith(c["key"][:len(t)]) for t in tracked):
+            match_tracked = False
+            for t in tracked:
+                if t.startswith("SCHED|"):
+                    # Schedule-based: match by name substring
+                    sched_name = t[6:].lower()
+                    if sched_name in c["match"].lower() or c["match"].lower() in sched_name:
+                        match_tracked = True
+                        break
+                else:
+                    # Live listing key match
+                    if c["key"][:60] == t[:60]:
+                        match_tracked = True
+                        break
+
+            if match_tracked:
                 msg = (
                     f"🔔 <b>Tracked Match — Price Changed!</b>\n"
                     f"<i>{now}</i>\n\n"
                     f"{c['dir']} <b>{c['match']}</b> [{c['category']}]\n"
                     f"Previous: {convert(c['old'], currency)}\n"
                     f"New price: <b>{convert(c['new'], currency)}</b>  ({c['pct']:+.1f}%)\n\n"
-                    f"🎟 <a href='{COLLECT_URL}'>Buy on FIFA Collect</a>"
+                    f"🎟 <a href='{SOURCE_URL}'>View &amp; Buy on FIFA Collect</a>\n"
+                    f"🏟 <a href='{BOOKING_URL}'>Official FIFA Tickets</a>"
                 )
                 await send_msg(app, chat_id, msg)
 
@@ -265,7 +279,7 @@ async def check_and_notify(app: Application):
                         f"{c['dir']} <b>{c['match']}</b> [{c['category']}]\n"
                         f"  {convert(c['old'], currency)} → <b>{convert(c['new'], currency)}</b> ({c['pct']:+.1f}%)"
                     )
-                lines.append(f"\n🎟 <a href='{COLLECT_URL}'>View All Listings</a>")
+                lines.append(f"\n🎟 <a href='{SOURCE_URL}'>View All Listings</a>")
                 await send_msg(app, chat_id, "\n".join(lines))
 
     data["prices"] = new_prices
@@ -400,38 +414,94 @@ async def cmd_schedule(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_schedule_groups(update.message)
 
 
-async def show_track_menu(chat_id: int, target, edit=False):
+async def show_track_menu(chat_id: int, target, edit=False, page: int = 0):
+    """
+    Show ALL trackable matches in two tabs:
+      • Tab 1 — Live Listings (from scraped prices, paginated 8 per page)
+      • Tab 2 — By Schedule  (all SCHEDULE entries grouped, always visible)
+    page >= 0  → live listings page
+    page == -1 → show schedule-based tracking
+    """
     data   = load_data()
     prices = data.get("prices", {})
+    PAGE_SIZE = 8
+
+    if page == -1:
+        # ── Schedule-based tracking ──────────────────────────────────────────
+        rows = []
+        for m in SCHEDULE:
+            short = m["match"][:28]
+            label = f"{m['date']} | {short}"
+            # Use match name as the tracking key
+            sched_key = f"SCHED|{m['match']}"
+            rows.append([InlineKeyboardButton(label, callback_data=f"track_{sched_key[:60]}")])
+        rows.append([
+            InlineKeyboardButton("📋 Live Listings »", callback_data="track_page_0"),
+            InlineKeyboardButton("« Back", callback_data="menu_main"),
+        ])
+        text = (
+            "📅 <b>Track by Match Schedule</b>\n\n"
+            "Select any match — you'll be alerted the moment a ticket listing appears or changes price.\n\n"
+            "<i>Includes group stage, knockouts, semis & Final.</i>"
+        )
+        if edit:
+            await target.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        else:
+            await target.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        return
+
+    # ── Live listings (paginated) ────────────────────────────────────────────
     if not prices:
-        text = "⏳ Price data not loaded yet. Try again in a minute."
+        text = "⏳ Price data not loaded yet — wait up to 5 minutes for the first check."
         if edit:
             await target.edit_message_text(text)
         else:
             await target.reply_text(text)
         return
 
-    keys   = list(prices.keys())[:10]
-    rows   = []
-    for k in keys:
+    all_keys   = list(prices.keys())
+    total      = len(all_keys)
+    total_pages= max(1, (total + PAGE_SIZE - 1) // PAGE_SIZE)
+    page       = max(0, min(page, total_pages - 1))
+    page_keys  = all_keys[page * PAGE_SIZE : (page + 1) * PAGE_SIZE]
+
+    rows = []
+    for k in page_keys:
         info  = prices[k]
-        label = f"{info['match'][:22]} [{info['category']}]"
+        cur   = get_user(data, chat_id).get("currency", "USD")
+        label = f"{info['match'][:20]} [{info['category']}] {convert(info['price'], cur)}"
         rows.append([InlineKeyboardButton(label, callback_data=f"track_{k[:60]}")])
-    rows.append([InlineKeyboardButton("« Back", callback_data="menu_main")])
+
+    # Pagination row
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("◀ Prev", callback_data=f"track_page_{page-1}"))
+    nav.append(InlineKeyboardButton(f"{page+1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton("Next ▶", callback_data=f"track_page_{page+1}"))
+    rows.append(nav)
+
+    rows.append([
+        InlineKeyboardButton("📅 Track by Schedule", callback_data="track_page_-1"),
+        InlineKeyboardButton("« Back", callback_data="menu_main"),
+    ])
 
     text = (
-        "🔔 <b>Track a Specific Match</b>\n\n"
-        "Pick a match below. You'll be alerted on <b>every price change</b> — no minimum threshold.\n\n"
-        "<i>Showing first 10 listings by price.</i>"
+        f"🔔 <b>Track a Match — Live Listings</b> (page {page+1}/{total_pages})\n\n"
+        "Tap any listing to track it. You'll be alerted on <b>every price change</b> — no minimum.\n\n"
+        f"<i>{total} total listings. Use 📅 Track by Schedule to find semis/final.</i>\n\n"
+        f"🔗 <a href='{SOURCE_URL}'>View all on FIFA Collect</a>"
     )
     if edit:
-        await target.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await target.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+                                       disable_web_page_preview=True)
     else:
-        await target.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        await target.reply_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows),
+                                disable_web_page_preview=True)
 
 
 async def cmd_track(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await show_track_menu(update.effective_chat.id, update.message)
+    await show_track_menu(update.effective_chat.id, update.message, edit=False, page=0)
 
 
 async def show_myalerts(chat_id: int, target, edit=False):
@@ -594,6 +664,16 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text("\n".join(lines), parse_mode="HTML",
                                   reply_markup=kb, disable_web_page_preview=True)
 
+    # Pagination for track menu
+    elif d.startswith("track_page_"):
+        page_val = d[len("track_page_"):]
+        page_num = int(page_val)  # -1 = schedule view
+        await show_track_menu(chat_id, q, edit=True, page=page_num)
+
+    # No-op (page counter button)
+    elif d == "noop":
+        pass  # just dismiss the query, already answered above
+
     # Track a specific match
     elif d.startswith("track_"):
         key = d[6:]
@@ -602,27 +682,49 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if chat_id not in data["subscribers"]:
             data["subscribers"].append(chat_id)
 
-        already = any(
-            key.startswith(t[:len(key)]) or t.startswith(key[:len(t)])
-            for t in data["specific_alerts"][uid]
-        )
+        already = key in data["specific_alerts"][uid]
         if not already:
             data["specific_alerts"][uid].append(key)
             save_data(data)
-            prices   = data.get("prices", {})
-            full_key = next((k for k in prices if k[:60] == key or key[:60] == k[:60]), None)
-            info     = prices.get(full_key) if full_key else None
+
+            # Build confirmation message
             currency = get_user(data, chat_id).get("currency", "USD")
-            price_line = f"\nCurrent price: <b>{convert(info['price'], currency)}</b>" if info else ""
+            prices   = data.get("prices", {})
+
+            # Is it a schedule-based track?
+            if key.startswith("SCHED|"):
+                match_name = key[6:]
+                # Find any live listing for this match
+                live = [(k, v) for k, v in prices.items() if match_name.lower() in v["match"].lower()]
+                if live:
+                    live_lines = "\n".join(
+                        f"  • [{v['category']}] <b>{convert(v['price'], currency)}</b>"
+                        for _, v in sorted(live, key=lambda x: x[1]["price"])[:5]
+                    )
+                    extra = f"\n\n<b>Current listings:</b>\n{live_lines}"
+                else:
+                    extra = "\n\n<i>No live listings yet — you'll be alerted when tickets appear.</i>"
+                link_line = f"\n🔗 <a href='{SOURCE_URL}'>View on FIFA Collect</a>"
+            else:
+                full_key = next((k for k in prices if k[:60] == key[:60]), None)
+                info     = prices.get(full_key) if full_key else None
+                extra    = f"\nCurrent price: <b>{convert(info['price'], currency)}</b>" if info else ""
+                link_line= f"\n🔗 <a href='{SOURCE_URL}'>View on FIFA Collect</a>"
+
             await q.edit_message_text(
-                f"✅ <b>Match is now being tracked!</b>\n"
-                f"You'll receive an alert on <b>every single price change</b> — no minimum.{price_line}\n\n"
-                f"Manage tracked matches: /myalerts",
+                f"✅ <b>Now tracking this match!</b>\n"
+                f"You'll be alerted on <b>every price change</b> — no minimum threshold.{extra}{link_line}\n\n"
+                f"Manage all tracked matches: /myalerts",
                 parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("« Main Menu", callback_data="menu_main")]]),
+                disable_web_page_preview=True,
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("📋 My Alerts", callback_data="menu_myalerts"),
+                     InlineKeyboardButton("🔔 Track More", callback_data="menu_track")],
+                    [InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")],
+                ]),
             )
         else:
-            await q.answer("You're already tracking this match.", show_alert=True)
+            await q.answer("✅ Already tracking this match!", show_alert=True)
 
     # Clear all tracked alerts
     elif d == "clear_alerts":
@@ -655,7 +757,7 @@ async def callback_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     elif d == "menu_schedule":
         await show_schedule_groups(q, edit=True)
     elif d == "menu_track":
-        await show_track_menu(chat_id, q, edit=True)
+        await show_track_menu(chat_id, q, edit=True, page=0)
     elif d == "menu_buy":
         await show_buy(q, edit=True)
     elif d == "menu_myalerts":
